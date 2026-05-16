@@ -12,19 +12,19 @@ Ness runs autonomously on a schedule. It monitors your GitHub repos, finds issue
 GitHub repos
      │
      ▼
- [Scanner]  ──────────────────────────────────────────────────┐
+ [Scanner]   ─────────────────────────────────────────────────┐
      │ raw findings → SQLite                                   │
      ▼                                                         │
- [Legislative] ── plans, decomposed tasks ──▶ GitHub comments  │
+ [Planner]  ── plans, decomposed tasks ──▶ GitHub comments    │
      │                                                         │
      ▼                                                         │
- [Judicial] ── selected tasks + budget check ──────────────────┤
+ [Scheduler] ── selected tasks (pure Python, no LLM) ─────────┤
      │                                                         │
      ▼                                                         │
- [Executive] ── code, commits, PRs ──▶ GitHub + status comment │
+ [Executor]  ── code, commits, PRs ──▶ GitHub + status comment│
      │                                                         │
      ▼                                                         │
- [Digester] ── daily/weekly summaries ──▶ your inbox ◀─────────┘
+ [Digester]  ── daily/weekly summaries ──▶ your inbox ◀───────┘
      │
      ▼
   you (reply to redirect, CC'd on escalations)
@@ -39,11 +39,11 @@ Each agent has its own email address. This makes routing, filtering, and audit t
 | Agent | Email | Model | Role |
 |---|---|---|---|
 | Orchestrator | `orchestrator@ness.local` | — | Schedules, routes inbound mail, manages run cycle |
-| Scanner | `scanner@ness.local` | Haiku | Fetches GitHub state, finds new issues/PRs |
-| Legislative | `legislative@ness.local` | Sonnet | Decomposes issues into tasks, writes Plans, writes Summaries |
-| Judicial | `judicial@ness.local` | Haiku | Reads Plans, selects tasks within daily budget |
-| Executive | `executive@ness.local` | Sonnet | Executes tasks, commits, posts Status |
-| Digester | `digest@ness.local` | Sonnet | Produces daily/weekly email summaries for human |
+| Scanner | `scanner@ness.local` | — | Fetches GitHub state, writes findings to SQLite. No LLM. |
+| Planner | `planner@ness.local` | Sonnet | Decomposes issues into task checklists, posts `## Plan` comments |
+| Scheduler | `scheduler@ness.local` | — | Reads plans + budget, selects tasks. Pure Python, no LLM. |
+| Executor | `executor@ness.local` | Sonnet | Executes tasks via mini-swe-agent, commits, posts `## Status` |
+| Digester | `digest@ness.local` | Haiku/Sonnet | Produces daily/weekly email summaries for human |
 
 **You receive mail from:** `digest@ness.local`, `orchestrator@ness.local` (escalations).
 
@@ -56,15 +56,15 @@ Each agent has its own email address. This makes routing, filtering, and audit t
 Triggered by cron (default: every 6h, configurable).
 
 ```
-1. Scanner     → poll GitHub repos → write findings to SQLite
-2. Legislative → read new issues without Plan → post ## Plan comments
-3. Legislative → update existing Plans from ## Status comments
-4. Judicial    → read Plans + spent_today.json → select tasks within budget
-5. Executive   → work selected tasks sequentially → commit + post ## Status
-6. Executive   → check hard budget between tasks; stop if exceeded
-7. Legislative → collect ## Status → post ## Summary per repo
-8. Judicial    → verify summaries; flag stuck tasks (3+ runs) as needs-human
-9. Orchestrator→ log costs to spent_today.json
+1. Scanner    → poll GitHub repos → write findings to SQLite
+2. Planner    → read new issues without Plan → post ## Plan comments
+3. Planner    → update existing Plans from ## Status comments
+4. Scheduler  → read Plans + spent_today.json → select tasks (pure Python)
+5. Executor   → work selected tasks sequentially → commit + post ## Status
+6. Executor   → check hard budget between tasks; stop if exceeded
+7. Planner    → collect ## Status → post ## Summary per repo
+8. Scheduler  → flag stuck tasks (3+ consecutive failures) as needs-human
+9. Orchestrator → log costs to spent_today.json
 ```
 
 At 18:00 daily: Digester reads SQLite + GitHub comments, sends daily digest.
@@ -218,10 +218,11 @@ ness/
 │   ├── state.py             # SQLite schema + read/write
 │   ├── github_client.py     # httpx wrapper: issues, comments, labels, branches
 │   ├── budget.py            # spent_today.json, limit checks, cost tracking
-│   ├── scanner.py           # fetch repos → write findings
-│   ├── legislative.py       # plan decomposition, summary generation
-│   ├── judicial.py          # task selection within budget
-│   ├── executive.py         # task execution loop
+│   ├── run_tracker.py       # run_counts.json, consecutive failure tracking
+│   ├── scanner.py           # fetch repos → write findings (no LLM)
+│   ├── planner.py           # plan decomposition, summary generation (Sonnet)
+│   ├── scheduler.py         # task selection within budget (pure Python, no LLM)
+│   ├── executor.py          # task execution via mini-swe-agent
 │   ├── digester.py          # daily/weekly/monthly email synthesis
 │   └── orchestrator.py      # cron cycle, inbound mail routing
 │
@@ -237,7 +238,7 @@ ness/
 └── tests/
     ├── conftest.py
     ├── test_budget.py
-    ├── test_judicial.py
+    ├── test_scheduler.py
     └── test_protocol.py
 ```
 
@@ -281,15 +282,15 @@ dependencies = [
 
 ## What to build first (order matters)
 
-1. `state.py` + `budget.py` — schema and cost tracking, everything else depends on this
+1. `state.py` + `budget.py` + `run_tracker.py` — schema, cost tracking, stuck detection
 2. `github_client.py` — fetch issues, read bot comments by header, post comments
-3. `scanner.py` — repo scan → findings
-4. `judicial.py` — simplest LLM role, easiest to test
-5. `legislative.py` — plan decomposition
-6. `executive.py` — task execution (stub first, wire real LLM later)
+3. `scanner.py` — repo scan → findings (no LLM, easiest to test)
+4. `scheduler.py` — pure Python task selection, no LLM, most testable logic
+5. `planner.py` — plan decomposition (Sonnet)
+6. `executor.py` — task execution via mini-swe-agent (stub first)
 7. `digester.py` — daily email
 8. `mail.py` + `orchestrator.py` — wire everything together
-9. Tests for budget and judicial (mock LLM)
+9. Tests for budget and scheduler (no mocking needed, pure functions)
 
 ---
 

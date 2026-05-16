@@ -39,15 +39,20 @@ From conversation analysis (the "anti-pattern" objection):
 
 ---
 
-## 4. Role-based agent separation (from gh-tribunal research)
+## 4. Role-based agent separation (evolved from gh-tribunal → lazycoder)
 
-Three-branch model from `gh-tribunal/CLAUDE.md`:
+Original gh-tribunal model: Legislative / Judicial / Executive. **This was refuted and simplified** in practice (lazycoder project):
 
-- **Legislative (Sonnet):** scans, plans, decomposes, summarizes. CAN create tasks, CANNOT execute.
-- **Judicial (Haiku):** reads plans + budget, selects tasks for day. CAN prioritize, CANNOT modify plans.
-- **Executive (Sonnet):** executes tasks via coding agent. CAN write/commit code, CANNOT change priorities.
+- `legislative.py` → **deleted**, replaced by `planner.py` (Sonnet, smaller scope)
+- `judicial.py` → **deleted**, replaced by `scheduler.py` (**pure Python, zero LLM** — sorts by priority labels, accumulates estimates, cuts at budget)
+- `executive.py` → **deleted**, replaced by `executor.py` (mini-swe-agent wrapper)
 
-**Finding:** strict separation prevents scope creep and makes cost accounting clean. Each role has defined tools, cannot exceed its mandate.
+**Evolved model (used in Ness):**
+- **Planner (Sonnet):** reads issues, decomposes into task checklists with cost estimates, posts `## Plan` and `## Summary` comments.
+- **Scheduler (pure Python):** reads plans + `spent_today.json`, checks `run_counts.json` for stuck tasks, selects tasks within budget. Zero LLM calls — most testable component.
+- **Executor (Sonnet via mini-swe-agent):** executes selected tasks, commits to `bot/run-{date}` branch, opens PRs, posts `## Status`.
+
+**Key insight:** Scheduler as pure Python eliminates an entire LLM call per run and makes prioritization logic deterministic and fully testable (19 unit tests with no mocking needed in lazycoder).
 
 ---
 
