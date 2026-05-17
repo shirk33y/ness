@@ -1,48 +1,82 @@
 # Ness
 
-Autonomous GitHub project manager. Manages multiple hobby repos via email — no dashboard, no web UI, just inbox.
-
-Ness monitors your repos, finds issues and opportunities, decomposes them into tasks, executes them within a daily token budget, and sends you concise digests. You reply to redirect it.
+General-purpose email-driven agent harness. Provides scheduling, budget control, email transport, conversation history, and self-improvement loops. Domain logic lives in harness files supplied by consumers.
 
 ---
 
-## How it works
+## What it is
 
-Five agents run on a schedule. Each has its own email address.
+Ness is infrastructure. It does not know what your agents do — that's defined by harness files (Markdown prompt templates) loaded at runtime.
 
-| Agent | Does |
-|---|---|
-| Scanner | Polls GitHub repos, writes findings to SQLite |
-| Legislative | Decomposes issues into task checklists, writes `## Plan` comments |
-| Judicial | Selects tasks within daily budget |
-| Executive | Executes tasks: reads code, writes code, commits, posts `## Status` |
-| Digester | Sends daily/weekly email summaries to you |
+```
+harness files (supplied by consumer)
+        +
+   Ness (scaffold)
+        =
+   autonomous agents
+```
 
-You receive mail from `digest@ness.local`. You direct the system by replying to `orchestrator@ness.local`. Agents CC you on escalations.
+**Example consumer:** [lazycoder](../lazycoder) — GitHub project manager that runs on Ness, supplies its own harness files.
+
+---
+
+## What Ness provides
+
+- **Email transport** — aiosmtpd receive + aiosmtplib send + Maildir (full history in files)
+- **Scheduler** — pure Python, selects which harnesses run each cycle within budget
+- **Budget control** — soft/hard daily limits, cost tracking per run, escalation on overrun
+- **Run tracking** — consecutive failure detection, stuck harness escalation
+- **Self-improvement loop** — Evaluator reads run history, proposes harness diffs, A/B testing, human APPROVE/MODIFY/REJECT
+
+## What Ness does NOT provide
+
+- Any domain logic (that's the harness)
+- External API clients (harnesses bring their own via MCP or subprocess)
+- Web UI or dashboard
+
+---
+
+## Harness contract
+
+A consumer provides one or more `.md` files in `harnesses/`. Ness loads them, fills context slots, invokes LLM, routes output.
+
+```markdown
+# harnesses/my-agent-v1.md
+
+## Role
+...
+
+## Context
+Today: {{date}}
+Budget remaining: {{budget_remaining}}
+Recent runs: {{run_history}}
+
+## Task
+{{task}}
+
+## Output
+Send email to orchestrator@ness.local with subject: [ness] result | {{date}}
+```
 
 ---
 
 ## Cadence
 
-- **Every 6h** (configurable): scan → plan → select → execute → summarize
-- **Daily 18:00:** digest email, max 5 items or "nothing notable"
-- **Sunday 10:00:** weekly synthesis with patterns and one question for you
-- **First Monday:** monthly trend report — awaits your APPROVE/MODIFY/REJECT
-
-Speed is fully config-driven. Start conservative (`max_tasks_per_run: 1`, `soft_limit_daily: $0.10`), scale up as trust builds.
+- **Configurable interval** (default 6h): Scheduler selects harnesses → Runner invokes LLM → result to Maildir
+- **Daily 18:00:** Digester synthesizes Maildir → digest email, max 5 items
+- **Sunday 10:00:** weekly synthesis + one question
+- **First Monday:** Evaluator sends harness improvement proposals
 
 ---
 
 ## Stack
 
-Python + aiosmtpd + Maildir + SQLite + litellm. No external services needed beyond GitHub API and Anthropic API.
-
-Models: Haiku for filtering/triage, Sonnet for planning and synthesis.
+Python + aiosmtpd + Maildir + SQLite + litellm.
 
 ---
 
 ## Docs
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — agents, email protocol, data model, file structure, build order
-- [SCIENCE.md](SCIENCE.md) — research foundations: what we know about harness quality, agent roles, temporal loops, tech stack decisions
-- [conversation-t3W5.md](conversation-t3W5.md) — prior design conversation (CAH architecture, email transport, role separation)
+- [ARCHITECTURE.md](ARCHITECTURE.md) — harness system, agents, email protocol, data model, build order
+- [SCIENCE.md](SCIENCE.md) — research foundations: harness-driven design, temporal loops, budget enforcement
+- [LAZYCODER.md](LAZYCODER.md) — how lazycoder uses Ness

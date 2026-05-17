@@ -1,75 +1,132 @@
 # ARCHITECTURE.md — Ness
 
-Email-driven autonomous GitHub project manager.
+Email-driven autonomous agent harness. Domain-agnostic — behavior defined by harness files, not hardcoded Python.
 
 ---
 
 ## Overview
 
-Ness runs autonomously on a schedule. It monitors your GitHub repos, finds issues and opportunities, manages tasks, and communicates with you via email. You reply to redirect it. No dashboard, no web UI — just email.
+Ness is a thin Python scaffold that:
+1. Receives email → routes to correct harness
+2. Loads harness (prompt + context) → invokes LLM
+3. Sends result via email → stores in Maildir
+4. Tracks cost + run history in SQLite
+5. Periodically evaluates its own performance → proposes prompt improvements
+
+What the agents *do* is defined in `harnesses/` as Markdown files. Python knows nothing about domains.
 
 ```
-GitHub repos
+inbound email
      │
      ▼
- [Scanner]   ─────────────────────────────────────────────────┐
-     │ raw findings → SQLite                                   │
-     ▼                                                         │
- [Planner]  ── plans, decomposed tasks ──▶ GitHub comments    │
-     │                                                         │
-     ▼                                                         │
- [Scheduler] ── selected tasks (pure Python, no LLM) ─────────┤
-     │                                                         │
-     ▼                                                         │
- [Executor]  ── code, commits, PRs ──▶ GitHub + status comment│
-     │                                                         │
-     ▼                                                         │
- [Digester]  ── daily/weekly summaries ──▶ your inbox ◀───────┘
-     │
-     ▼
-  you (reply to redirect, CC'd on escalations)
+ [Orchestrator]  ── route by subject/headers ──▶ [Runner]
+                                                      │
+                                              load harness file
+                                              inject context
+                                              invoke LLM
+                                                      │
+                                              ┌───────┴────────┐
+                                              ▼                ▼
+                                         Maildir          SQLite
+                                     (full history)   (cost + runs)
+                                              │
+                                              ▼
+                                      outbound email
+                                      → you / next agent
 ```
+
+At scheduled intervals: [Evaluator] reads run history → proposes harness improvements → you APPROVE/MODIFY/REJECT.
+
+---
+
+## Core concept: harness files
+
+A harness is a Markdown file that defines an agent's behavior. Python reads it, fills in context slots, sends to LLM.
+
+```markdown
+# harnesses/research-scout-v1.md
+
+## Role
+You are a research scout monitoring AI/ML papers and tools.
+
+## Context
+Today: {{date}}
+Recent runs: {{run_history}}
+Budget remaining: {{budget_remaining}}
+
+## Task
+{{task}}
+
+## Output format
+Send email to digest@ness.local with subject: [ness] finding | {{date}}
+Body: 3 bullet points max. One sentence each. Cost estimate for follow-up.
+
+## Constraints
+- Max 3 findings per run
+- Skip anything older than 7 days
+- If unsure relevance: skip, don't include
+```
+
+Swapping harness = different agent behavior, zero Python changes.
+
+---
+
+## Self-improvement loop
+
+After N runs, Evaluator reads Maildir history + SQLite metrics and proposes changes:
+
+```
+[Evaluator] reads:
+  - last 30 run outputs (Maildir)
+  - cost per run, result quality ratings (SQLite)
+  - current harness file
+
+proposes:
+  - harness diff (specific prompt changes)
+  - A/B variant (runs both, tracks which performs better)
+  - deprecation (remove harness that consistently underperforms)
+
+→ email to you: APPROVE / MODIFY / REJECT
+→ on APPROVE: harness file updated, old version moved to harnesses/_archive/
+```
+
+A/B testing: Orchestrator alternates between `harness-v1.md` and `harness-v2.md` for N runs, Evaluator compares metrics, picks winner.
 
 ---
 
 ## Agents
 
-Each agent has its own email address. This makes routing, filtering, and audit trivial.
+Each agent is an email address + a harness file. Orchestrator maps addresses to harnesses.
 
-| Agent | Email | Model | Role |
+| Agent | Email | Model | Harness |
 |---|---|---|---|
-| Orchestrator | `orchestrator@ness.local` | — | Schedules, routes inbound mail, manages run cycle |
-| Scanner | `scanner@ness.local` | — | Fetches GitHub state, writes findings to SQLite. No LLM. |
-| Planner | `planner@ness.local` | Sonnet | Decomposes issues into task checklists, posts `## Plan` comments |
-| Scheduler | `scheduler@ness.local` | — | Reads plans + budget, selects tasks. Pure Python, no LLM. |
-| Executor | `executor@ness.local` | Sonnet | Executes tasks via mini-swe-agent, commits, posts `## Status` |
-| Digester | `digest@ness.local` | Haiku/Sonnet | Produces daily/weekly email summaries for human |
+| Orchestrator | `orchestrator@ness.local` | — | `harnesses/_orchestrator.md` (routing logic) |
+| Runner | `runner@ness.local` | Sonnet | whichever harness was routed to it |
+| Digester | `digest@ness.local` | Haiku | `harnesses/_digester.md` |
+| Evaluator | `evaluator@ness.local` | Sonnet | `harnesses/_evaluator.md` |
+| Scheduler | `scheduler@ness.local` | — | Pure Python, no LLM — budget + run selection |
 
-**You receive mail from:** `digest@ness.local`, `orchestrator@ness.local` (escalations).
+**You receive mail from:** `digest@ness.local`, `evaluator@ness.local` (proposals), `orchestrator@ness.local` (escalations).
 
-**You send mail to:** `orchestrator@ness.local` (directives, APPROVE/MODIFY/REJECT replies).
+**You send mail to:** `orchestrator@ness.local` — directives, APPROVE/MODIFY/REJECT replies.
 
 ---
 
 ## Run cycle
 
-Triggered by cron (default: every 6h, configurable).
+Triggered by cron (configurable interval).
 
 ```
-1. Scanner    → poll GitHub repos → write findings to SQLite
-2. Planner    → read new issues without Plan → post ## Plan comments
-3. Planner    → update existing Plans from ## Status comments
-4. Scheduler  → read Plans + spent_today.json → select tasks (pure Python)
-5. Executor   → work selected tasks sequentially → commit + post ## Status
-6. Executor   → check hard budget between tasks; stop if exceeded
-7. Planner    → collect ## Status → post ## Summary per repo
-8. Scheduler  → flag stuck tasks (3+ consecutive failures) as needs-human
-9. Orchestrator → log costs to spent_today.json
+1. Orchestrator  → check inbound mail → process any human replies first
+2. Scheduler     → read spent_today.json + run_counts.json → select which harnesses run (pure Python)
+3. Runner        → load harness → inject context → invoke LLM → send output email + store in Maildir
+4. Orchestrator  → log costs to SQLite + spent_today.json
+5. Scheduler     → flag stuck harnesses (3+ consecutive failures) → escalate to human
 ```
 
-At 18:00 daily: Digester reads SQLite + GitHub comments, sends daily digest.
-On Sunday 10:00: Digester sends weekly synthesis.
-On first Monday: Digester sends monthly trend report (waits for APPROVE/MODIFY/REJECT reply).
+At 18:00 daily: Digester synthesizes Maildir → sends daily digest (max 5 items).
+On Sunday 10:00: Digester sends weekly synthesis + one question for you.
+On first Monday: Evaluator sends harness improvement proposals.
 
 ---
 
@@ -78,41 +135,20 @@ On first Monday: Digester sends monthly trend report (waits for APPROVE/MODIFY/R
 ### Subject format
 
 ```
-[ness] <agent> | <repo> | <issue#> | <action>
-[ness] digest | daily | 2026-05-16
+[ness] <harness> | <action> | <date>
+[ness] digest | daily | 2026-05-17
 [ness] ESCALATE | <reason>
+[ness] PROPOSE | <harness-name> | v2
 ```
 
 ### Custom headers
 
 ```
-X-Ness-Agent: legislative
-X-Ness-Repo: owner/repo-name
-X-Ness-Issue: 42
-X-Ness-Run: 2026-05-16T18:00:00Z
+X-Ness-Agent: runner
+X-Ness-Harness: research-scout-v1
+X-Ness-Run: 2026-05-17T18:00:00Z
 X-Ness-Cost: 0.04
-```
-
-### GitHub comment conventions
-
-```markdown
-## Plan
-- [ ] Add OAuth middleware (~$0.05)
-- [ ] Write integration tests (~$0.03)
-
-## Status
-Task: Add OAuth middleware
-Branch: ness/run-2026-05-16
-Result: Tests passing. Linting fails on line 47.
-Cost: $0.04 (estimate: $0.05)
-
-## Summary
-Run 2026-05-16: 2 tasks, 1 done, 1 partial.
-Total: $0.08 / $0.50 budget.
-
-## Paused
-Estimate: $0.05, spent: $0.11 (2.2x over).
-@shirk33y review needed.
+X-Ness-Variant: a          # for A/B runs
 ```
 
 ---
@@ -123,24 +159,31 @@ All in `config.yaml`. No code changes to throttle.
 
 ```yaml
 schedule:
-  run_interval_hours: 6        # how often the cycle runs
+  run_interval_hours: 6
   digest_time: "18:00"
   weekly_synthesis_day: Sunday
-  monthly_report_day: 1        # first of month
+  evaluator_day: 1           # first of month
 
 budget:
-  soft_limit_daily: 0.50       # judicial uses this to select tasks
-  hard_limit_daily: 1.00       # executive checks before every LLM call
-  cost_overrun_multiplier: 2.0 # pause task if actual > estimate × this
+  soft_limit_daily: 0.50
+  hard_limit_daily: 1.00
+  cost_overrun_multiplier: 2.0
 
 pace:
-  max_tasks_per_run: 3         # executive hard cap per cycle
-  max_repos_per_run: 5         # scanner hard cap
+  max_runs_per_cycle: 3      # how many harnesses run per cron tick
+  stuck_threshold: 3         # consecutive failures before escalation
+
+harnesses:
+  active:
+    - research-scout-v1
+    - github-pm-v1           # optional, if you want GitHub PM as one harness
+  ab_tests:
+    - [research-scout-v1, research-scout-v2]
 ```
 
 Start settings for day 1 (conservative):
-- `run_interval_hours: 24` (daily only)
-- `max_tasks_per_run: 1`
+- `run_interval_hours: 24`
+- `max_runs_per_cycle: 1`
 - `soft_limit_daily: 0.10`
 
 ---
@@ -150,35 +193,31 @@ Start settings for day 1 (conservative):
 ### SQLite tables
 
 ```sql
--- what scanner found
-CREATE TABLE findings (
-    id TEXT PRIMARY KEY,           -- ness-2026-05-16-0042
-    repo TEXT NOT NULL,
-    issue_number INTEGER,
-    type TEXT,                     -- new_issue, pr_opened, pr_merged, etc.
-    url TEXT,
-    discovered_at TEXT,
-    processed INTEGER DEFAULT 0
-);
-
--- cost tracking (resets daily)
+-- one row per LLM invocation
 CREATE TABLE runs (
     id TEXT PRIMARY KEY,
     run_at TEXT,
-    agent TEXT,
-    repo TEXT,
-    issue_number INTEGER,
+    harness TEXT,              -- harness filename (without .md)
+    variant TEXT,              -- 'a', 'b', or null
     estimated REAL,
     actual REAL,
-    result TEXT                    -- completed, partial, paused, skipped
+    result TEXT,               -- completed, partial, failed, skipped
+    quality INTEGER            -- 1-5, set by evaluator or human reply
 );
 
--- per-repo config overrides
-CREATE TABLE repos (
-    full_name TEXT PRIMARY KEY,    -- owner/repo
+-- budget tracking (resets daily)
+CREATE TABLE budget (
+    date TEXT PRIMARY KEY,
+    spent REAL DEFAULT 0
+);
+
+-- harness metadata
+CREATE TABLE harnesses (
+    name TEXT PRIMARY KEY,
+    version INTEGER DEFAULT 1,
     enabled INTEGER DEFAULT 1,
-    priority INTEGER DEFAULT 2,    -- 1=critical, 2=high, 3=medium, 4=low
-    budget_share REAL DEFAULT 1.0  -- relative budget weight
+    promoted_at TEXT,          -- when last version was approved
+    ab_active INTEGER DEFAULT 0
 );
 ```
 
@@ -186,9 +225,9 @@ CREATE TABLE repos (
 
 ```json
 {
-  "date": "2026-05-16",
-  "tasks": [
-    {"repo": "owner/repo-a", "issue": 12, "estimated": 0.05, "actual": 0.04}
+  "date": "2026-05-17",
+  "runs": [
+    {"harness": "research-scout-v1", "estimated": 0.05, "actual": 0.04}
   ],
   "total": 0.04
 }
@@ -203,6 +242,7 @@ ness/
 ├── README.md
 ├── ARCHITECTURE.md          ← this file
 ├── SCIENCE.md               ← research foundations
+├── LAZYCODER.md             ← comparison with lazycoder
 ├── pyproject.toml
 ├── uv.lock
 ├── justfile
@@ -211,35 +251,39 @@ ness/
 │
 ├── ness/
 │   ├── __init__.py
-│   ├── __main__.py          # python -m ness orchestrator | worker | cli
+│   ├── __main__.py          # python -m ness run | cli
 │   ├── config.py            # pydantic-settings
 │   ├── mail.py              # aiosmtpd handler, aiosmtplib sender, Maildir
-│   ├── protocol.py          # pydantic: RunEnvelope, DigestEnvelope, Escalate
+│   ├── protocol.py          # pydantic: Envelope, Proposal, Escalation
 │   ├── state.py             # SQLite schema + read/write
-│   ├── github_client.py     # httpx wrapper: issues, comments, labels, branches
 │   ├── budget.py            # spent_today.json, limit checks, cost tracking
-│   ├── run_tracker.py       # run_counts.json, consecutive failure tracking
-│   ├── scanner.py           # fetch repos → write findings (no LLM)
-│   ├── planner.py           # plan decomposition, summary generation (Sonnet)
-│   ├── scheduler.py         # task selection within budget (pure Python, no LLM)
-│   ├── executor.py          # task execution via mini-swe-agent
-│   ├── digester.py          # daily/weekly/monthly email synthesis
-│   └── orchestrator.py      # cron cycle, inbound mail routing
+│   ├── run_tracker.py       # run_counts.json, consecutive failure detection
+│   ├── harness.py           # load .md, fill context slots, invoke LLM
+│   ├── scheduler.py         # select which harnesses run (pure Python, no LLM)
+│   ├── orchestrator.py      # cron cycle, inbound mail routing, reply handling
+│   └── evaluator.py         # run history analysis, propose diffs, A/B tracking
 │
-├── harnesses/               # NL harness definitions (data, not code)
-│   ├── pm-v1.md             # project manager harness
-│   └── _archive/
+├── harnesses/               # agent behavior lives here, not in Python
+│   ├── _orchestrator.md     # routing + escalation logic
+│   ├── _digester.md         # daily/weekly synthesis
+│   ├── _evaluator.md        # self-improvement proposals
+│   ├── research-scout-v1.md # example domain harness
+│   └── _archive/            # superseded harness versions
 │
 ├── data/                    # gitignored, runtime state
 │   ├── ness.db
 │   ├── spent_today.json
-│   └── maildir/
+│   ├── run_counts.json
+│   └── maildir/             # full conversation history in files
+│       ├── new/
+│       ├── cur/
+│       └── tmp/
 │
 └── tests/
     ├── conftest.py
     ├── test_budget.py
     ├── test_scheduler.py
-    └── test_protocol.py
+    └── test_harness.py
 ```
 
 ---
@@ -249,15 +293,16 @@ ness/
 | Layer | Choice | Why |
 |---|---|---|
 | Language | Python 3.12+ | Faster MVP, official Anthropic SDK, easier prompt iteration |
-| SMTP receive | aiosmtpd | Lightweight local SMTP listener, no full mail server needed in v1 |
+| SMTP receive | aiosmtpd | Lightweight local SMTP listener |
 | SMTP send | aiosmtplib | Async SMTP client |
-| Mail storage | Maildir | Simple, auditable, no daemon needed |
-| State | SQLite (via aiosqlite) | Zero-infra, sufficient for ~10 repos |
-| LLM | litellm | Model-agnostic, has `completion_cost()`, works with Anthropic SDK |
-| GitHub API | httpx + PyGithub | Direct REST, no magic |
+| Mail storage | Maildir | Files, human-readable, full history, no daemon |
+| State | SQLite (via aiosqlite) | Zero-infra, sufficient for any harness count |
+| LLM | litellm | Model-agnostic, `completion_cost()`, swap models without code changes |
 | Config | pydantic-settings | Validates config.yaml, env var overrides |
-| Task runner | just | Simpler than make for this use case |
-| Packaging | uv | Fast, good lockfile, replaces pip-tools |
+| Task runner | just | Simple |
+| Packaging | uv | Fast lockfile |
+
+Removed: PyGithub, httpx — no domain-specific clients in core. Harnesses that need external APIs bring their own tools via MCP or subprocess.
 
 ---
 
@@ -270,8 +315,6 @@ dependencies = [
     "aiosmtplib",
     "aiosqlite",
     "litellm",
-    "PyGithub",
-    "httpx",
     "pydantic-settings",
     "pyyaml",
     "click",
@@ -283,33 +326,31 @@ dependencies = [
 ## What to build first (order matters)
 
 1. `state.py` + `budget.py` + `run_tracker.py` — schema, cost tracking, stuck detection
-2. `github_client.py` — fetch issues, read bot comments by header, post comments
-3. `scanner.py` — repo scan → findings (no LLM, easiest to test)
-4. `scheduler.py` — pure Python task selection, no LLM, most testable logic
-5. `planner.py` — plan decomposition (Sonnet)
-6. `executor.py` — task execution via mini-swe-agent (stub first)
-7. `digester.py` — daily email
-8. `mail.py` + `orchestrator.py` — wire everything together
-9. Tests for budget and scheduler (no mocking needed, pure functions)
+2. `harness.py` — load .md, fill `{{slots}}`, invoke LLM, return result
+3. `scheduler.py` — pure Python: which harnesses run this cycle, within budget
+4. `mail.py` — receive + send + Maildir write
+5. `orchestrator.py` — wire cron cycle + reply routing
+6. `evaluator.py` — read history, propose diffs (stub first)
+7. `digester.py` — daily email synthesis
+8. Tests for budget + scheduler (pure functions, no mocking)
 
 ---
 
-## Escalation triggers (bypass schedule)
+## Escalation triggers
 
 Send to human immediately:
-- Task actual cost > 2× estimate → `## Paused` comment + @mention + `needs-human` label
-- Hard budget exceeded for the day
-- Task stuck 3+ consecutive runs → `needs-human` label
-- GitHub API rate limit sustained > 30 min
+- Actual cost > 2× estimate for any single run
+- Hard daily budget exceeded
+- Harness stuck 3+ consecutive runs
+- Evaluator proposes harness change (always requires human APPROVE)
 
 ---
 
 ## Non-goals (v1)
 
 - Web UI, dashboard
-- Parallel task execution across repos
-- Twitter/X or Discord monitoring
+- Parallel harness execution
 - Vector DB / semantic memory
 - Multi-machine deployment
-- Docker per service (single compose.yml maximum)
 - Real-time agent choreography
+- Any hardcoded domain logic in Python (that's what harnesses are for)
