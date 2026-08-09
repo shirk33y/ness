@@ -1,3 +1,5 @@
+<!-- project-index-summary: Email-driven autonomous GitHub project manager -->
+
 # Ness
 
 General-purpose email-driven agent harness. Provides scheduling, budget control, email transport, conversation history, and self-improvement loops. Domain logic lives in harness files supplied by consumers.
